@@ -152,12 +152,15 @@ class OverlapRowParallelLinear(nn.Module):
         )
 
         # === PIPELINED EXECUTION ===
+        actual_chunks = 0
         for chunk_idx in range(self.num_chunks):
             start_idx = chunk_idx * chunk_size
             end_idx = min(start_idx + chunk_size, total_tokens)
 
             if start_idx >= total_tokens:
                 break
+
+            actual_chunks += 1
 
             # Extract chunk from input
             x_chunk = x_flat[start_idx:end_idx]
@@ -187,8 +190,8 @@ class OverlapRowParallelLinear(nn.Module):
 
         # === FINAL SYNCHRONIZATION ===
         # Ensure all communication completes before returning
-        for event in self.comm_events[:self.num_chunks]:
-            event.synchronize()
+        for i in range(actual_chunks):
+            self.comm_events[i].synchronize()
 
         # Reshape back to original dimensions
         return output.view(batch_size, seq_len, self.out_features)
@@ -240,20 +243,21 @@ def benchmark_layer(
         Average latency in milliseconds
     """
     # Warmup phase to stabilize GPU clocks and cache
-    for _ in range(num_warmup):
-        _ = layer(input_tensor)
-    torch.cuda.synchronize()
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = layer(input_tensor)
+        torch.cuda.synchronize()
 
-    # Timed phase using CUDA events
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+        # Timed phase using CUDA events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    start_event.record()
-    for _ in range(num_iterations):
-        _ = layer(input_tensor)
-    end_event.record()
+        start_event.record()
+        for _ in range(num_iterations):
+            _ = layer(input_tensor)
+        end_event.record()
 
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
     # Calculate average latency
     total_time_ms = start_event.elapsed_time(end_event)

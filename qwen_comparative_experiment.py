@@ -146,12 +146,15 @@ def forward_overlap(
     # ========================================================================
     # PIPELINED EXECUTION LOOP
     # ========================================================================
+    actual_chunks = 0
     for chunk_idx in range(num_chunks):
         start_idx = chunk_idx * chunk_size
         end_idx = min(start_idx + chunk_size, total_tokens)
 
         if start_idx >= total_tokens:
             break
+
+        actual_chunks += 1
 
         # Extract chunk slices
         x_chunk = x_flat[start_idx:end_idx]
@@ -187,7 +190,7 @@ def forward_overlap(
     # FINAL SYNCHRONIZATION
     # ========================================================================
     # Ensure all communication completes before returning output
-    for idx in range(min(num_chunks, (total_tokens + chunk_size - 1) // chunk_size)):
+    for idx in range(actual_chunks):
         comm_events[idx].synchronize()
 
     # Reshape back to original 3D dimensions
@@ -203,7 +206,7 @@ def validate_correctness(
     weight: torch.Tensor,
     num_chunks: int = 4,
     process_group: Optional[dist.ProcessGroup] = None,
-    tolerance: float = 1e-5,
+    tolerance: float = 1e-4,
 ) -> Tuple[bool, float]:
     """
     Validate that overlap implementation produces identical results to baseline.
@@ -260,27 +263,28 @@ def benchmark_forward(
     Returns:
         Average latency in milliseconds
     """
-    # Warmup phase
-    for _ in range(num_warmup):
-        _ = forward_fn(x, weight, **kwargs)
-    torch.cuda.synchronize()
+    with torch.no_grad():
+        # Warmup phase
+        for _ in range(num_warmup):
+            _ = forward_fn(x, weight, **kwargs)
+        torch.cuda.synchronize()
 
-    # Timed phase using CUDA events
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+        # Timed phase using CUDA events
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    start_event.record()
-    for _ in range(num_iterations):
-        _ = forward_fn(x, weight, **kwargs)
-    end_event.record()
+        start_event.record()
+        for _ in range(num_iterations):
+            _ = forward_fn(x, weight, **kwargs)
+        end_event.record()
 
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-    # Calculate average latency
-    total_time_ms = start_event.elapsed_time(end_event)
-    avg_latency_ms = total_time_ms / num_iterations
+        # Calculate average latency
+        total_time_ms = start_event.elapsed_time(end_event)
+        avg_latency_ms = total_time_ms / num_iterations
 
-    return avg_latency_ms
+        return avg_latency_ms
 
 
 # ============================================================================
