@@ -1,0 +1,6 @@
+==3448== Warning: Child processes are not profiled. Use option --profile-child-processes to profile them.
+
+Profiling baseline mode...
+Config: BS=1, SeqLen=2048, In=4096, Out=12288, Chunks=4
+Profiling complete for baseline mode
+======== Warning: No profile data collected.

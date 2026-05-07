@@ -77,7 +77,7 @@ def test_correctness(rank: int, world_size: int):
         print(f"Max absolute difference:  {max_diff:.2e}")
         print(f"Mean absolute difference: {mean_diff:.2e}")
 
-        tolerance = 1e-3
+        tolerance = 1e-5
         if max_diff < tolerance:
             print(f"\n✓ PASS: Outputs match within tolerance ({tolerance})")
             print("=" * 80)
@@ -144,10 +144,10 @@ def test_chunk_sizes(rank: int, world_size: int):
         max_diff = torch.max(torch.abs(baseline_output - overlap_output)).item()
 
         if rank == 0:
-            status = "✓ PASS" if max_diff < 1e-3 else "✗ FAIL"
+            status = "✓ PASS" if max_diff < 1e-5 else "✗ FAIL"
             print(f"Chunks: {num_chunks:2d} | Max Diff: {max_diff:.2e} | {status}")
 
-        if max_diff >= 1e-3:
+        if max_diff >= 1e-5:
             all_passed = False
 
     if rank == 0:

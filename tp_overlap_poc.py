@@ -125,11 +125,15 @@ class OverlapRowParallelLinear(nn.Module):
         """
         Overlapped forward pass using chunked GEMM and pipelined all_reduce.
 
-        Pipeline Schedule:
+        Pipeline Schedule (with proper synchronization):
             Chunk 0: [Compute] -> [All-Reduce]
-            Chunk 1:              [Compute] -> [All-Reduce]
-            Chunk 2:                           [Compute] -> [All-Reduce]
+            Chunk 1:              Wait(Comm_0) -> [Compute] -> [All-Reduce]
+            Chunk 2:                              Wait(Comm_1) -> [Compute] -> [All-Reduce]
             ...
+
+        Key: Each chunk's computation waits for the previous chunk's communication
+        to complete, ensuring correctness while still achieving overlap between
+        chunk i's communication and chunk i+1's computation.
 
         Args:
             x: Input tensor [batch_size, seq_len, in_features]
@@ -168,6 +172,11 @@ class OverlapRowParallelLinear(nn.Module):
 
             # --- STAGE 1: COMPUTE CHUNK ---
             with torch.cuda.stream(self.compute_stream):
+                # CRITICAL: Wait for previous chunk's communication to complete
+                # This ensures correct pipelining and prevents data races
+                if chunk_idx > 0:
+                    self.compute_stream.wait_event(self.comm_events[chunk_idx - 1])
+
                 # Compute local GEMM for this chunk
                 torch.matmul(x_chunk, self.weight.t(), out=output_chunk)
 
@@ -266,22 +275,28 @@ def benchmark_layer(
     return avg_latency_ms
 
 
-def run_benchmark(rank: int, world_size: int):
+def run_benchmark(
+    rank: int,
+    world_size: int,
+    batch_size: int = 1,
+    seq_len: int = 2048,
+    out_features: int = 12288,
+    in_features: int = 4096,
+    num_chunks: int = 4,
+):
     """
     Main benchmark function comparing baseline vs overlap implementations.
 
     Args:
         rank: GPU rank
         world_size: Total number of GPUs
+        batch_size: Batch size for input tensor
+        seq_len: Sequence length for input tensor
+        out_features: Output feature dimension
+        in_features: Input feature dimension
+        num_chunks: Number of chunks for overlap implementation
     """
     setup_distributed(rank, world_size)
-
-    # === CONFIGURATION ===
-    batch_size = 8
-    seq_len = 2048
-    in_features = 4096
-    out_features = 4096
-    num_chunks = 4
 
     device = f"cuda:{rank}"
 
@@ -366,11 +381,18 @@ def main():
     Entry point for multi-GPU benchmark.
 
     Usage:
-        # Single-node, 2 GPUs:
+        # Single-node, 2 GPUs with default parameters:
         torchrun --nproc_per_node=2 tp_overlap_poc.py
 
-        # Single-node, 4 GPUs:
+        # Single-node, 4 GPUs with custom parameters:
         torchrun --nproc_per_node=4 tp_overlap_poc.py
+
+    Environment variables for custom configuration:
+        BATCH_SIZE: Batch size (default: 1)
+        SEQ_LEN: Sequence length (default: 2048)
+        OUT_FEATURES: Output feature dimension (default: 12288)
+        IN_FEATURES: Input feature dimension (default: 4096)
+        NUM_CHUNKS: Number of chunks for overlap (default: 4)
     """
     if not dist.is_available():
         raise RuntimeError("PyTorch distributed is not available")
@@ -388,7 +410,22 @@ def main():
             "Run with: torchrun --nproc_per_node=2 tp_overlap_poc.py"
         )
 
-    run_benchmark(rank, world_size)
+    # Get configuration from environment variables with defaults
+    batch_size = int(os.environ.get("BATCH_SIZE", 1))
+    seq_len = int(os.environ.get("SEQ_LEN", 2048))
+    out_features = int(os.environ.get("OUT_FEATURES", 12288))
+    in_features = int(os.environ.get("IN_FEATURES", 4096))
+    num_chunks = int(os.environ.get("NUM_CHUNKS", 4))
+
+    run_benchmark(
+        rank=rank,
+        world_size=world_size,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        out_features=out_features,
+        in_features=in_features,
+        num_chunks=num_chunks,
+    )
 
 
 if __name__ == "__main__":

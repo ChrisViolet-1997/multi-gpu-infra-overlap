@@ -1,83 +1,163 @@
-# Quick Start Guide
+# 快速开始指南
 
-## 1. Environment Check
+## 5分钟上手
+
+### 1. 检查环境
+
 ```bash
 python check_env.py
 ```
 
-## 2. Run Qwen-32B Comparative Experiment
+应该看到：
+- ✓ PyTorch installed
+- ✓ CUDA available
+- ✓ Distributed available
+- ✓ Found X GPUs
+
+### 2. 运行Benchmark
+
 ```bash
-# Option 1: Use launcher script (recommended)
-./run_qwen.sh 2
-
-# Option 2: Use torchrun directly
-torchrun --nproc_per_node=2 qwen_comparative_experiment.py
+./run_benchmark.sh
 ```
 
-## 3. Run Basic PoC
-```bash
-./run_benchmark.sh 2
+预期输出：
 ```
-
-## 4. Run Correctness Tests
-```bash
-torchrun --nproc_per_node=2 test_correctness.py
-```
-
-## 5. Run Advanced Analysis (Chunk Sweep)
-```bash
-torchrun --nproc_per_node=2 advanced_analysis.py
-```
-
-## Expected Results
-
-### Qwen-32B Experiment Output
-```
-====================================================================================================
-QWEN-32B TENSOR PARALLEL ROW-PARALLEL COMPARATIVE EXPERIMENT
-====================================================================================================
-
+================================================================================
+DOUBLE BUFFER OVERLAP BENCHMARK
+================================================================================
 Configuration:
-  World Size: 2 GPUs
-  Batch Size: 1
-  Num Chunks: 4
-  Sequence Lengths: [512, 1024, 2048, 4096]
-====================================================================================================
+  - World Size: 2 GPUs
+  - Batch Size: 1
+  - Sequence Length: 2048
+  ...
 
-====================================================================================================
-LAYER: MLP Down-Projection
-Shape: [batch, seq_len, 13824] @ [5120, 13824]
-====================================================================================================
+[1/3] Benchmarking Baseline (No Overlap)...
+[2/3] Benchmarking Original Overlap (with wait_event)...
+[3/3] Benchmarking Double Buffer Overlap...
 
-BatchSize    SeqLen     Baseline(ms)    Overlap(ms)     Speedup     Hidden%     Validation
-----------------------------------------------------------------------------------------------------
-1            512        2.345           1.876           20.0%       20.0%       ✓ PASS
-1            1024       4.123           3.012           26.9%       26.9%       ✓ PASS
-1            2048       7.891           5.432           31.2%       31.2%       ✓ PASS
-1            4096       15.234          10.123          33.5%       33.5%       ✓ PASS
+================================================================================
+RESULTS
+================================================================================
+Baseline Latency:              40.689 ms
+Original Overlap Latency:      41.972 ms
+Double Buffer Overlap Latency: 34.283 ms
+
+Original Overlap Speedup:      0.97x
+Double Buffer Speedup:         1.19x
+================================================================================
+
+✓ Double Buffer is 22.4% faster than Original Overlap!
+✓ SUCCESS: Double Buffer achieved 1.19x speedup!
 ```
 
-## Key Observations
+### 3. 验证正确性
 
-1. **Longer sequences show better overlap**: 4096 tokens achieve ~33% speedup vs 20% for 512 tokens
-2. **Communication hiding increases with problem size**: Larger GEMMs provide more compute to overlap
-3. **Validation always passes**: Overlap implementation is numerically identical to baseline
-
-## Troubleshooting
-
-### No GPUs detected
 ```bash
-nvidia-smi
+python test_correctness.py
 ```
 
-### NCCL errors
+应该看到：
+```
+Testing correctness of overlap implementations...
+✓ All tests passed!
+```
+
+## 常见问题
+
+### Q: 为什么加速比不高？
+
+A: 可能的原因：
+1. **问题规模太小**：通信时间 > 计算时间
+   - 解决：增大batch_size或seq_len
+   ```bash
+   BATCH_SIZE=4 SEQ_LEN=4096 ./run_benchmark.sh
+   ```
+
+2. **Chunk数量不合适**：
+   - 太少：overlap不充分
+   - 太多：overhead太大
+   - 解决：尝试不同值
+   ```bash
+   NUM_CHUNKS=8 ./run_benchmark.sh
+   ```
+
+3. **硬件限制**：PCIe带宽低于NVLink
+   - 检查：`nvidia-smi topo -m`
+
+### Q: 如何Profile分析？
+
+A: 使用nvprof：
+
 ```bash
-export NCCL_DEBUG=INFO
-torchrun --nproc_per_node=2 qwen_comparative_experiment.py
+# 进入scripts目录
+cd scripts
+
+# 运行完整的profile（包括baseline、原始overlap、double buffer）
+./profile_with_nvprof.sh
+
+# 分析overlap
+python analyze_double_buffer.py
 ```
 
-### Out of memory
-Reduce sequence length in `qwen_comparative_experiment.py`:
+或者只profile double buffer：
+
+```bash
+/usr/local/cuda/bin/nvprof --profile-child-processes --print-gpu-trace \
+    torchrun --nproc_per_node=2 scripts/profile_double_buffer.py \
+    2>&1 | tee profiles/my_profile.txt
+
+# 查看GEMM和NCCL kernels
+grep -E "volta_sgemm|ncclDevKernel" profiles/my_profile.txt | head -40
+```
+
+### Q: 如何在自己的模型中使用？
+
+A: 替换标准的Linear层：
+
 ```python
-sequence_lengths = [512, 1024]  # Instead of [512, 1024, 2048, 4096]
+from tp_overlap_double_buffer import DoubleBufferOverlapRowParallelLinear
+
+# 原来的代码
+# self.linear = RowParallelLinear(in_features, out_features)
+
+# 替换为
+self.linear = DoubleBufferOverlapRowParallelLinear(
+    in_features=in_features,
+    out_features=out_features,
+    num_chunks=4,  # 根据实际情况调整
+    process_group=your_tp_group,
+    device="cuda"
+)
 ```
+
+## 测试不同配置
+
+### 小规模测试
+```bash
+BATCH_SIZE=1 SEQ_LEN=1024 ./run_benchmark.sh
+```
+
+### 中等规模
+```bash
+BATCH_SIZE=2 SEQ_LEN=2048 ./run_benchmark.sh
+```
+
+### 大规模测试
+```bash
+BATCH_SIZE=8 SEQ_LEN=8192 OUT_FEATURES=24576 ./run_benchmark.sh
+```
+
+### 调整Chunk数量
+```bash
+# 测试不同chunk数量
+for chunks in 2 4 8 16; do
+    echo "Testing NUM_CHUNKS=$chunks"
+    NUM_CHUNKS=$chunks ./run_benchmark.sh
+done
+```
+
+## 下一步
+
+- 阅读 [README.md](README.md) 了解实现原理
+- 查看 [tp_overlap_double_buffer.py](tp_overlap_double_buffer.py) 源码
+- 使用nvprof分析自己的配置
