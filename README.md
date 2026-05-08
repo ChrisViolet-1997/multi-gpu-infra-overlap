@@ -1,301 +1,210 @@
-# Tensor Parallel Computation-Communication Overlap with Double Buffering
+# Multi-GPU Infrastructure: Tensor Parallel Computation-Communication Overlap
 
-高性能分布式训练中的计算-通信overlap优化实现，使用double buffering技术实现真正的并行执行。
+这个项目实现了 Tensor Parallel (TP) 场景下的计算-通信 overlap 优化，通过 chunking 和 double buffering 技术降低端到端延迟。
 
-## 📋 目录
-
-- [问题背景](#问题背景)
-- [解决方案](#解决方案)
-- [性能对比](#性能对比)
-- [快速开始](#快速开始)
-- [实现原理](#实现原理)
-- [Profile分析](#profile分析)
-- [文件结构](#文件结构)
-
-## 问题背景
-
-在Tensor Parallel训练中，Row-Parallel层的标准实现是串行的：
+## 项目结构
 
 ```
-[GEMM计算] → [AllReduce通信] → [GEMM计算] → [AllReduce通信] → ...
+multi-gpu-infra-overlap/
+├── base_implementation/          # 基础实现
+│   ├── tp_overlap_poc.py        # 基础 PoC
+│   ├── tp_overlap_double_buffer.py  # Double buffer 实现
+│   ├── test_correctness.py      # 正确性验证
+│   └── README_BASE.md           # 基础实现说明
+│
+├── parameter_grid_search/        # 任务1: 参数 Grid Search
+│   ├── advanced_benchmark.py    # 高级 benchmark 工具
+│   ├── run_advanced_benchmark.py  # 执行脚本
+│   ├── OPTIMIZATION_EXPERIMENTS.md  # 实验报告
+│   └── README.md                # 任务1说明
+│
+└── qwen3_integration/            # 任务2: Qwen3 集成
+    ├── qwen3_layer.py           # Qwen3 decoder layer
+    ├── adaptive_chunk_selector.py  # 自适应 chunk 选择
+    ├── grid_search_qwen3_chunks.py  # Grid search 工具
+    ├── compare_qwen3_configs.py  # 配置对比
+    ├── optimal_qwen3_chunks.py  # 最优配置
+    ├── QWEN3_PER_OPERATOR_OPTIMIZATION.md  # 实验报告
+    └── README.md                # 任务2说明
 ```
-
-这导致GPU在通信时空闲，浪费计算资源。
-
-### 初始Overlap尝试的问题
-
-最初的overlap实现虽然使用了多stream和chunking，但由于**数据竞争保护**导致完全串行执行：
-
-```python
-# 原始代码中的wait导致串行
-if chunk_idx > 0:
-    self.compute_stream.wait_event(self.comm_events[chunk_idx - 1])
-```
-
-**nvprof验证结果**：
-- Baseline: 40.7ms
-- 原始Overlap: 42.0ms (更慢！)
-- 原因：chunking开销 + 无真正overlap
-
-## 解决方案
-
-### Double Buffering
-
-使用**两个output buffer**交替使用，消除数据竞争：
-
-```
-Buffer 0: Chunk 0, Chunk 2, Chunk 4, ...
-Buffer 1: Chunk 1, Chunk 3, Chunk 5, ...
-```
-
-**关键优势**：
-- Chunk i 写入 Buffer A
-- Chunk i-1 通信读取 Buffer B
-- 无数据竞争，可并行执行
-
-### Timeline对比
-
-**原始Overlap (串行)**：
-```
-Time: ----[GEMM]----[NCCL]----[GEMM]----[NCCL]----
-      无overlap，完全串行
-```
-
-**Double Buffer (并行)**：
-```
-Compute Stream: ----[GEMM_0]----[GEMM_1]----[GEMM_2]----
-Comm Stream:    --------[NCCL_0]----[NCCL_1]----[NCCL_2]
-                        ^^^^^^^^ Overlap!
-```
-
-## 性能对比
-
-### Benchmark结果
-
-配置：`batch_size=1, seq_len=2048, in_features=4096, out_features=12288, num_chunks=4`
-
-| 实现方式 | 延迟 (ms) | 加速比 | 说明 |
-|---------|----------|--------|------|
-| Baseline | 40.7 | 1.00x | 串行执行 |
-| 原始Overlap | 42.0 | 0.97x | 无真正overlap，反而更慢 |
-| **Double Buffer** | **34.3** | **1.19x** | 真正的overlap |
-
-### nvprof验证
-
-**原始Overlap**：完全串行
-```
-1081.22ms  3.88ms GEMM
-1085.10ms  6.64ms NCCL  ← 等待GEMM完成
-1091.77ms  3.87ms GEMM  ← 等待NCCL完成
-```
-
-**Double Buffer**：真正overlap
-```
-978.62ms  4.68ms GEMM
-982.39ms  6.45ms NCCL  ← 与GEMM overlap 0.91ms
-983.33ms  5.07ms GEMM  ← 与NCCL overlap 5.07ms!
-```
-
-发现 **6个overlap区间**，总overlap时间 **13.28ms**
 
 ## 快速开始
 
 ### 环境要求
 
-- PyTorch with CUDA
-- 至少2个GPU
-- NCCL
+- Python 3.8+
+- PyTorch 2.0+ with CUDA
+- 至少 2 个 GPU (支持 NCCL)
+- NCCL 2.0+
 
-### 运行Benchmark
+### 安装依赖
 
 ```bash
-# 基础测试
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 运行示例
+
+#### 1. 基础 Double Buffer Overlap
+
+```bash
+cd base_implementation
 torchrun --nproc_per_node=2 tp_overlap_double_buffer.py
-
-# 测试不同配置
-BATCH_SIZE=4 SEQ_LEN=4096 torchrun --nproc_per_node=2 tp_overlap_double_buffer.py
-
-# 调整chunk数量
-NUM_CHUNKS=8 torchrun --nproc_per_node=2 tp_overlap_double_buffer.py
 ```
 
-### 正确性验证
+#### 2. 参数 Grid Search (任务1)
 
 ```bash
-python test_correctness.py
+cd parameter_grid_search
+torchrun --nproc_per_node=2 run_advanced_benchmark.py \
+  --in_features 6144 \
+  --out_features 12288 \
+  --num_chunks 8 \
+  --batch_size 1 \
+  --seq_len 2048
 ```
 
-## 实现原理
+#### 3. Qwen3 集成 (任务2)
 
-### 核心代码
+```bash
+cd qwen3_integration
+
+# Grid search 找最优配置
+BATCH_SIZE=512 SEQ_LEN=1 torchrun --nproc_per_node=2 grid_search_qwen3_chunks.py
+
+# 对比不同配置
+BATCH_SIZE=512 SEQ_LEN=1 torchrun --nproc_per_node=2 compare_qwen3_configs.py
+```
+
+## 核心技术
+
+### 1. Double Buffering
+
+使用两个输出缓冲区交替使用，消除数据竞争：
+- Chunk i 写入 buffer A，同时 chunk i-1 的通信从 buffer B 读取
+- 实现真正的计算-通信 overlap
+
+### 2. 分离 CUDA Streams
+
+- 计算和通信使用不同的 CUDA stream
+- 通过 Event 精确控制依赖关系
+
+### 3. Per-Operator Chunk Tuning
+
+- 不同算子需要不同的 chunk 数量
+- 基于输出维度和 Comp/Comm 比例自适应选择
+
+## 主要成果
+
+### 任务1: 参数优化 (Prefill Phase)
+
+**测试场景**: batch_size=1, seq_len=2048
+
+**最优配置**:
+- Input Features: 6144
+- Output Features: 12288
+- Num Chunks: 8
+
+**性能提升**:
+- Latency: 35.596 ms
+- Speedup: **1.44x**
+- Overlap: 30.6%
+
+**关键发现**:
+- Comp/Comm Ratio ≈ 1.0 时 overlap 效果最好
+- Chunk 数量需要平衡 overlap 粒度和调度开销
+- 8 chunks 是最优选择（chunk_size=256 tokens）
+
+### 任务2: Qwen3 集成
+
+#### Prefill Phase (seq_len=2048)
+
+**最优配置**: Per-operator tuning
+```python
+q_proj: 8, k_proj: 4, v_proj: 4, o_proj: 8,
+gate_proj: 16, up_proj: 16, down_proj: 4
+```
+
+**性能**: +2.8% vs Fixed 4 chunks
+
+#### Decode Phase - Batch Size 影响
+
+| Batch Size | Total Tokens | 最优策略 | 加速 |
+|------------|--------------|----------|------|
+| 1-64       | 1-64         | No Overlap | Baseline |
+| 512        | 512          | Per-operator | **+16.6%** |
+
+**关键发现**:
+- **Total tokens < 64**: 不要使用 overlap（性能下降 47-149%）
+- **Total tokens ≥ 512**: Per-operator tuning 非常有效（+16.6%）
+- **输出维度决定最优 chunk 数**: 大输出需要更多 chunks
+
+## 实际应用建议
+
+### 根据场景选择策略
 
 ```python
-class DoubleBufferOverlapRowParallelLinear(nn.Module):
-    def forward(self, x):
-        # 分配两个buffer
-        buffer_0 = torch.empty(...)
-        buffer_1 = torch.empty(...)
-        buffers = [buffer_0, buffer_1]
+def select_strategy(batch_size: int, seq_len: int):
+    total_tokens = batch_size * seq_len
 
-        for chunk_idx in range(num_chunks):
-            # 交替使用buffer
-            buffer_idx = chunk_idx % 2
-            current_buffer = buffers[buffer_idx]
-
-            # Compute: 写入当前buffer
-            with torch.cuda.stream(self.compute_stream):
-                # 移除了wait! 不同chunk用不同buffer
-                torch.matmul(x_chunk, self.weight.t(), out=buffer_chunk)
-                self.compute_events[chunk_idx].record()
-
-            # Comm: 读取当前buffer
-            with torch.cuda.stream(self.comm_stream):
-                self.comm_stream.wait_event(self.compute_events[chunk_idx])
-                dist.all_reduce(buffer_chunk, ...)
-                output_chunk.copy_(buffer_chunk)
+    if total_tokens <= 64:
+        # Decode with small batch: No Overlap
+        return "chunk=1 for all operators"
+    elif total_tokens <= 512:
+        # Decode with medium batch: Minimal chunking
+        return "chunk=2-4"
+    elif total_tokens >= 1024:
+        # Prefill or large batch decode: Per-operator tuning
+        return "Per-operator optimized chunks"
 ```
 
-### 为什么需要Double Buffer？
+### 性能预期
 
-**问题**：直接移除wait会导致数据竞争
-- Chunk i-1 的AllReduce正在**读取** output buffer
-- Chunk i 的GEMM会**写入**同一个buffer
-- Race condition！
+| 场景 | 配置 | 预期加速 |
+|------|------|----------|
+| Prefill (seq_len=2048) | Per-operator | +2.8% |
+| Decode (batch≤64) | No Overlap | Baseline (避免下降) |
+| Decode (batch=512) | Per-operator | +16.6% |
 
-**解决**：Double buffer
-- 不同chunk使用不同buffer
-- 读写操作在不同内存区域
-- 无数据竞争，安全并行
+## 优化原则
 
-## Profile分析
+1. **Comp/Comm 平衡**: 目标 Comp/Comm Ratio ≈ 1.0
+2. **Total tokens 是关键**: tokens < 64 时不要用 overlap
+3. **输出维度决定 chunks**: 大输出需要更多 chunks
+4. **Chunk size 为 2^n**: GPU 内存对齐优化
+5. **避免过小 chunk**: chunk_size < 128 调度开销过大
 
-### 使用nvprof分析
+## 性能指标
 
-```bash
-# 进入scripts目录
-cd scripts
+### Overlap 指标
 
-# 运行profile脚本（会profile三个版本）
-./profile_with_nvprof.sh
+- **Speedup**: (Comp + Comm) / Total_Latency
+- **Overlap Percentage**: (Comp + Comm - Total) / (Comp + Comm) × 100%
+- **Overlap Ratio**: (Comp + Comm - Total) / min(Comp, Comm)
 
-# 分析overlap
-python analyze_double_buffer.py
-```
+### 最佳实践
 
-或者手动profile：
+- Prefill: Speedup 1.3-1.5x
+- Decode (large batch): Speedup 1.15-1.20x
+- Comp/Comm Ratio: 0.8-1.2 (最佳范围)
 
-```bash
-# Profile double buffer
-/usr/local/cuda/bin/nvprof --profile-child-processes --print-gpu-trace \
-    torchrun --nproc_per_node=2 scripts/profile_double_buffer.py \
-    2>&1 | tee profiles/double_buffer_nvprof.txt
+## 参考文献
 
-# 提取GEMM和NCCL kernels
-grep -E "volta_sgemm|ncclDevKernel" profiles/double_buffer_nvprof.txt | head -40
-```
+- PyTorch Distributed: https://pytorch.org/docs/stable/distributed.html
+- NCCL Documentation: https://docs.nvidia.com/deeplearning/nccl/
+- Megatron-LM Tensor Parallel: https://github.com/NVIDIA/Megatron-LM
 
-### 关键指标
+## 实验环境
 
-从nvprof输出可以看到：
+- **硬件**: 2x GPU with NVLink
+- **框架**: PyTorch with NCCL backend
+- **模型**: Qwen3-8B
+- **实验日期**: 2026-05-08
 
-1. **GEMM时间**: ~4-5ms per chunk
-2. **NCCL时间**: ~6-7ms per chunk
-3. **Overlap时间**: ~13ms total
-4. **加速比**: 1.19x
+## 许可证
 
-### Timeline分析
+本项目仅用于研究和学习目的。
 
-使用analyze_double_buffer.py自动检测overlap：
+## 联系方式
 
-```bash
-cd scripts
-python analyze_double_buffer.py
-```
-
-输出示例：
-```
-Found 6 overlapping kernel pairs:
-
-1. GEMM [978.62-983.30ms]
-   overlaps with
-   NCCL [982.39-988.84ms]
-   Overlap duration: 0.91ms
-
-✓ SUCCESS: Found 6 overlaps!
-  Total overlap time: 13.28ms
-```
-
-## 文件结构
-
-```
-.
-├── README.md                          # 本文档
-├── tp_overlap_poc.py                  # 原始overlap实现（有wait，无真正overlap）
-├── tp_overlap_double_buffer.py        # Double buffer优化实现 ⭐
-├── test_correctness.py                # 正确性测试
-├── check_env.py                       # 环境检查
-├── run_benchmark.sh                   # 快速benchmark脚本
-│
-├── scripts/                           # 辅助脚本
-│   ├── profile_double_buffer.py       # Profile脚本
-│   ├── analyze_double_buffer.py       # Timeline分析
-│   ├── simple_profiler.py             # 简单性能测试
-│   └── ...
-│
-├── profiles/                          # Profile输出
-│   ├── baseline_nvprof.txt
-│   ├── overlap_nvprof.txt
-│   └── ...
-│
-└── archive/                           # 历史实验代码
-    └── ...
-```
-
-## 进一步优化
-
-### 1. 调整Chunk数量
-
-```bash
-# 测试不同chunk数量
-for chunks in 2 4 8 16; do
-    NUM_CHUNKS=$chunks torchrun --nproc_per_node=2 tp_overlap_double_buffer.py
-done
-```
-
-**建议**：
-- 小问题：num_chunks=2-4
-- 大问题：num_chunks=8-16
-
-### 2. 增大问题规模
-
-Overlap收益随问题规模增加：
-
-```bash
-# 更大的batch和sequence length
-BATCH_SIZE=8 SEQ_LEN=8192 torchrun --nproc_per_node=2 tp_overlap_double_buffer.py
-```
-
-### 3. 多级Pipeline
-
-可以扩展到3-buffer或更复杂的pipeline结构。
-
-## 关键收获
-
-1. **诊断方法**：nvprof + timeline分析是发现overlap问题的关键
-2. **数据竞争**：必须考虑读写冲突，不能简单移除同步
-3. **Double Buffer**：经典的空间换时间策略，消除数据竞争
-4. **性能验证**：实测加速19%，证明overlap有效
-
-## 参考资料
-
-- [Megatron-LM Tensor Parallel](https://github.com/NVIDIA/Megatron-LM)
-- [PyTorch Distributed](https://pytorch.org/docs/stable/distributed.html)
-- [CUDA Streams and Events](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#streams)
-
-## License
-
-MIT
-
-## 贡献
-
-欢迎提Issue和PR！
+如有问题或建议，请提交 Issue。
