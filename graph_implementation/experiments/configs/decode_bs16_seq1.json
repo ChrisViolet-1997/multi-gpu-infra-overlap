@@ -1,0 +1,15 @@
+{
+  "batch_size": 16,
+  "seq_len": 1,
+  "total_tokens": 16,
+  "world_size": 2,
+  "optimal_chunks": {
+    "q_proj_chunks": 1,
+    "k_proj_chunks": 1,
+    "v_proj_chunks": 1,
+    "o_proj_chunks": 1,
+    "gate_proj_chunks": 1,
+    "up_proj_chunks": 1,
+    "down_proj_chunks": 1
+  }
+}

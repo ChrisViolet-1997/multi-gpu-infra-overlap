@@ -18,7 +18,8 @@ import math
 
 # Import our overlap implementation and adaptive selector
 import sys
-sys.path.insert(0, '/root/autodl-tmp/multi-gpu-infra-overlap')
+sys.path.insert(0, '/root/autodl-tmp/multi-gpu-infra-overlap/base_implementation')
+sys.path.insert(0, '/root/autodl-tmp/multi-gpu-infra-overlap/qwen3_integration')
 from tp_overlap_double_buffer import DoubleBufferOverlapRowParallelLinear
 from adaptive_chunk_selector import Qwen3ChunkConfig
 
