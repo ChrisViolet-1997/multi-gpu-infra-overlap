@@ -42,3 +42,5 @@
 `parameter_grid_search/OPTIMIZATION_EXPERIMENTS.md`、`qwen3_integration/QWEN3_PER_OPERATOR_OPTIMIZATION.md` 和 `graph_implementation/experiments/EXPERIMENT_SUMMARY.md` 保存了早期实验记录。报告中的速度提升和 token 阈值不应视为经过当前代码验证的结论。
 
 当前主要入口是上面的单卡数值验证。执行多 GPU benchmark 前，需要先以真实 TP 布局重新集成和验证 column-parallel 与 row-parallel 算子，并在目标 GPU 互联上测量。
+
+双卡机器的环境探测、分阶段正确性验证和 overlap 测量流程见 [MULTI_GPU_VALIDATION_GUIDE.md](MULTI_GPU_VALIDATION_GUIDE.md)。
