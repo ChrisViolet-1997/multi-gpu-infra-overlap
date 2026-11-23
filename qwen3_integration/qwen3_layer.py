@@ -62,8 +62,14 @@ class Qwen3Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
 
-        self.q_size = num_attention_heads * head_dim  # 4096
-        self.kv_size = num_key_value_heads * head_dim  # 1024
+        world_size = dist.get_world_size(process_group) if dist.is_initialized() else 1
+        if num_attention_heads % world_size or num_key_value_heads % world_size:
+            raise ValueError("attention and KV heads must be divisible by TP world size")
+        self.local_num_attention_heads = num_attention_heads // world_size
+        self.local_num_key_value_heads = num_key_value_heads // world_size
+        self.q_size = num_attention_heads * head_dim
+        self.kv_size = num_key_value_heads * head_dim
+        self.local_q_size = self.local_num_attention_heads * head_dim
 
         # Use adaptive chunk config or defaults
         if chunk_config is None:
@@ -76,6 +82,7 @@ class Qwen3Attention(nn.Module):
             num_chunks=chunk_config.q_proj_chunks,
             process_group=process_group,
             device=device,
+            parallel_mode="column",
         )
 
         self.k_proj = DoubleBufferOverlapRowParallelLinear(
@@ -84,6 +91,7 @@ class Qwen3Attention(nn.Module):
             num_chunks=chunk_config.k_proj_chunks,
             process_group=process_group,
             device=device,
+            parallel_mode="column",
         )
 
         self.v_proj = DoubleBufferOverlapRowParallelLinear(
@@ -92,6 +100,7 @@ class Qwen3Attention(nn.Module):
             num_chunks=chunk_config.v_proj_chunks,
             process_group=process_group,
             device=device,
+            parallel_mode="column",
         )
 
         # Output projection with overlap
@@ -101,6 +110,7 @@ class Qwen3Attention(nn.Module):
             num_chunks=chunk_config.o_proj_chunks,
             process_group=process_group,
             device=device,
+            input_is_sharded=True,
         )
 
         # Q and K normalization (Qwen3 specific)
@@ -131,15 +141,15 @@ class Qwen3Attention(nn.Module):
 
         # Reshape for multi-head attention
         query_states = query_states.view(
-            batch_size, seq_len, self.num_attention_heads, self.head_dim
+            batch_size, seq_len, self.local_num_attention_heads, self.head_dim
         ).transpose(1, 2)  # [batch, num_heads, seq, head_dim]
 
         key_states = key_states.view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            batch_size, seq_len, self.local_num_key_value_heads, self.head_dim
         ).transpose(1, 2)  # [batch, num_kv_heads, seq, head_dim]
 
         value_states = value_states.view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            batch_size, seq_len, self.local_num_key_value_heads, self.head_dim
         ).transpose(1, 2)  # [batch, num_kv_heads, seq, head_dim]
 
         # Apply Q and K normalization
@@ -148,7 +158,7 @@ class Qwen3Attention(nn.Module):
 
         # Expand KV heads for GQA (repeat each KV head 4 times)
         # num_attention_heads / num_key_value_heads = 32 / 8 = 4
-        num_repeats = self.num_attention_heads // self.num_key_value_heads
+        num_repeats = self.local_num_attention_heads // self.local_num_key_value_heads
         key_states = key_states.repeat_interleave(num_repeats, dim=1)
         value_states = value_states.repeat_interleave(num_repeats, dim=1)
 
@@ -166,7 +176,7 @@ class Qwen3Attention(nn.Module):
 
         # Reshape back
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.q_size)
+        attn_output = attn_output.view(batch_size, seq_len, self.local_q_size)
 
         # Output projection with overlap
         output = self.o_proj(attn_output)
@@ -204,6 +214,7 @@ class Qwen3MLP(nn.Module):
             num_chunks=chunk_config.gate_proj_chunks,
             process_group=process_group,
             device=device,
+            parallel_mode="column",
         )
 
         self.up_proj = DoubleBufferOverlapRowParallelLinear(
@@ -212,6 +223,7 @@ class Qwen3MLP(nn.Module):
             num_chunks=chunk_config.up_proj_chunks,
             process_group=process_group,
             device=device,
+            parallel_mode="column",
         )
 
         # Down projection with overlap
@@ -221,6 +233,7 @@ class Qwen3MLP(nn.Module):
             num_chunks=chunk_config.down_proj_chunks,
             process_group=process_group,
             device=device,
+            input_is_sharded=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

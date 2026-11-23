@@ -46,8 +46,14 @@ class CUDAGraphQwen3Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
 
+        world_size = dist.get_world_size(process_group) if dist.is_initialized() else 1
+        if num_attention_heads % world_size or num_key_value_heads % world_size:
+            raise ValueError("attention and KV heads must be divisible by TP world size")
+        self.local_num_attention_heads = num_attention_heads // world_size
+        self.local_num_key_value_heads = num_key_value_heads // world_size
         self.q_size = num_attention_heads * head_dim
         self.kv_size = num_key_value_heads * head_dim
+        self.local_q_size = self.local_num_attention_heads * head_dim
 
         if chunk_config is None:
             chunk_config = Qwen3ChunkConfig()
@@ -61,6 +67,7 @@ class CUDAGraphQwen3Attention(nn.Module):
             device=device,
             static_input_shape=static_input_shape,
             enable_graph=False,
+            parallel_mode="column",
         )
 
         self.k_proj = CUDAGraphDoubleBufferOverlapRowParallelLinear(
@@ -71,6 +78,7 @@ class CUDAGraphQwen3Attention(nn.Module):
             device=device,
             static_input_shape=static_input_shape,
             enable_graph=False,
+            parallel_mode="column",
         )
 
         self.v_proj = CUDAGraphDoubleBufferOverlapRowParallelLinear(
@@ -81,6 +89,7 @@ class CUDAGraphQwen3Attention(nn.Module):
             device=device,
             static_input_shape=static_input_shape,
             enable_graph=False,
+            parallel_mode="column",
         )
 
         # Output projection
@@ -98,6 +107,7 @@ class CUDAGraphQwen3Attention(nn.Module):
             device=device,
             static_input_shape=o_proj_input_shape,
             enable_graph=False,
+            input_is_sharded=True,
         )
 
         # Q and K normalization
@@ -122,15 +132,15 @@ class CUDAGraphQwen3Attention(nn.Module):
         seq_len = hidden_states.shape[1]
 
         query_states = query_states.view(
-            batch_size, seq_len, self.num_attention_heads, self.head_dim
+            batch_size, seq_len, self.local_num_attention_heads, self.head_dim
         ).transpose(1, 2)
 
         key_states = key_states.view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            batch_size, seq_len, self.local_num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
         value_states = value_states.view(
-            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+            batch_size, seq_len, self.local_num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
         # Apply Q and K normalization (can be captured)
@@ -138,7 +148,7 @@ class CUDAGraphQwen3Attention(nn.Module):
         key_states = self.k_norm(key_states)
 
         # Expand KV heads for GQA (can be captured)
-        num_repeats = self.num_attention_heads // self.num_key_value_heads
+        num_repeats = self.local_num_attention_heads // self.local_num_key_value_heads
         key_states = key_states.repeat_interleave(num_repeats, dim=1)
         value_states = value_states.repeat_interleave(num_repeats, dim=1)
 
@@ -157,7 +167,7 @@ class CUDAGraphQwen3Attention(nn.Module):
 
         # Reshape back (can be captured)
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.q_size)
+        attn_output = attn_output.view(batch_size, seq_len, self.local_q_size)
 
         # Output projection (CUDAGraph)
         output = self.o_proj(attn_output)
@@ -193,6 +203,7 @@ class CUDAGraphQwen3MLP(nn.Module):
             device=device,
             static_input_shape=static_input_shape,
             enable_graph=False,
+            parallel_mode="column",
         )
 
         self.up_proj = CUDAGraphDoubleBufferOverlapRowParallelLinear(
@@ -203,6 +214,7 @@ class CUDAGraphQwen3MLP(nn.Module):
             device=device,
             static_input_shape=static_input_shape,
             enable_graph=False,
+            parallel_mode="column",
         )
 
         # Down projection
@@ -220,6 +232,7 @@ class CUDAGraphQwen3MLP(nn.Module):
             device=device,
             static_input_shape=down_proj_input_shape,
             enable_graph=False,
+            input_is_sharded=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
